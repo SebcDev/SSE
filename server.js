@@ -2,6 +2,22 @@ const http = require("http");
 
 const clients = new Map();
 
+function parseBody(req, callback) {
+  let body = "";
+  req.on("data", (chunk) => (body += chunk));
+  req.on("end", () => callback(JSON.parse(body)));
+}
+
+function pushToAgent(agentId, eventName, data) {
+  const agentClients = clients.get(agentId);
+  if (agentClients && agentClients.size > 0) {
+    const payload = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
+    agentClients.forEach((client) => client.write(payload));
+    return { sent: true, recipients: agentClients.size };
+  }
+  return { sent: false, reason: "no connected agent" };
+}
+
 const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -38,25 +54,74 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Push endpoint — simulate a screen pop event
+  // Push endpoint — simulate a screen pop event (used by test UI)
   if (url.pathname === "/push" && req.method === "POST") {
-    let body = "";
-    req.on("data", (chunk) => (body += chunk));
-    req.on("end", () => {
-      const event = JSON.parse(body);
-      const agentId = event.agentId || "default";
-      const agentClients = clients.get(agentId);
-
-      if (agentClients && agentClients.size > 0) {
-        const payload = `event: screenpop\ndata: ${JSON.stringify(event)}\n\n`;
-        agentClients.forEach((client) => client.write(payload));
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ sent: true, recipients: agentClients.size }));
-      } else {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ sent: false, reason: "no connected agent" }));
-      }
+    parseBody(req, (event) => {
+      const result = pushToAgent(event.agentId || "default", "screenpop", event);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(result));
     });
+    return;
+  }
+
+  // CCaaS-facing API — this is what the CCaaS would call on inbound call
+  // POST /api/inbound-call
+  // {
+  //   "agentId": "agent-001",
+  //   "contactId": "003XXXXXXXXXXXX",
+  //   "callerNumber": "+33612345678",
+  //   "callerName": "Jean Dupont",
+  //   "interactionId": "uuid-from-ccaas"
+  // }
+  if (url.pathname === "/api/inbound-call" && req.method === "POST") {
+    parseBody(req, (body) => {
+      if (!body.agentId || !body.contactId) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "agentId and contactId are required" }));
+        return;
+      }
+      const event = {
+        type: "inbound_call",
+        recordId: body.contactId,
+        callerNumber: body.callerNumber || "",
+        callerName: body.callerName || "",
+        interactionId: body.interactionId || "",
+        timestamp: new Date().toISOString(),
+      };
+      const result = pushToAgent(body.agentId, "screenpop", event);
+      console.log(`Inbound call → agent ${body.agentId}, contact ${body.contactId}: ${result.sent ? "delivered" : "no agent connected"}`);
+      res.writeHead(result.sent ? 200 : 404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(result));
+    });
+    return;
+  }
+
+  // CCaaS-facing API — call ended, could trigger call logging
+  // POST /api/call-ended
+  if (url.pathname === "/api/call-ended" && req.method === "POST") {
+    parseBody(req, (body) => {
+      const event = {
+        type: "call_ended",
+        interactionId: body.interactionId || "",
+        duration: body.duration || 0,
+        disposition: body.disposition || "",
+        timestamp: new Date().toISOString(),
+      };
+      const result = pushToAgent(body.agentId || "default", "callended", event);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(result));
+    });
+    return;
+  }
+
+  // List connected agents (diagnostic)
+  if (url.pathname === "/api/agents" && req.method === "GET") {
+    const agents = [];
+    clients.forEach((connections, agentId) => {
+      if (connections.size > 0) agents.push({ agentId, connections: connections.size });
+    });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ agents }));
     return;
   }
 
